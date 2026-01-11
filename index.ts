@@ -1,100 +1,154 @@
-const USERS = { 
-   "Jonathan": "JonathanAndJames",
-   "James": "JamesPassword2025",
-   "Wen": "WenPassword2025"
-};
+const USERS: Record<string, string> = { "Jonathan": "JonathanAndJames" };
 
 const server = Bun.serve({
-  port: 3000,
-  hostname: "0.0.0.0", // This makes it listen on your 10.0.0.x IP
+  port: 3001,
+  hostname: "0.0.0.0",
   async fetch(req) {
     const url = new URL(req.url);
     const auth = req.headers.get("Authorization");
 
-    // MULTI-USER LOGIN CHECK
-    let isAuthorized = false;
-    if (auth && auth.startsWith("Basic ")) {
-      const credentials = atob(auth.split(" ")[1]); // Decodes "user:pass"
-      const [username, password] = credentials.split(":");
-
- // Check if the user exists and the password matches
-      if (USERS[username] && USERS[username] === password) {
-        isAuthorized = true;
-      }
-    }
-
-    if (!isAuthorized) {
+    // 1. Proper Basic Auth validation
+    if (!auth?.startsWith("Basic ")) {
       return new Response("Unauthorized", {
         status: 401,
-        headers: { "WWW-Authenticate": 'Basic realm="Bun File Manager"' },
+        headers: { "WWW-Authenticate": 'Basic realm="Jellyfish AI OS"' }
       });
     }
 
-    // 2. Delete Handler
-    if (req.method === "DELETE" && url.pathname.startsWith("/delete/")) {
-      const fileName = decodeURIComponent(url.pathname.slice(8));
+    try {
+      const decoded = atob(auth.slice(6));
+      const [username, password] = decoded.split(":");
+      if (!username || !password || USERS[username] !== password) {
+        return new Response("Invalid credentials", {
+          status: 401,
+          headers: { "WWW-Authenticate": 'Basic realm="Jellyfish AI OS"' }
+        });
+      }
+    } catch {
+      return new Response("Bad auth header", { status: 401 });
+    }
+
+    // 2. GET - UI
+    if (req.method === "GET" && url.pathname === "/") {
+      let modelOptions = `
+        <option value="deepseek-r1:1.5b">deepseek-r1:1.5b</option>
+        <option value="llama3.2:1b">llama3.2:1b</option>
+      `;
+
       try {
-        const { unlink } = require("node:fs/promises");
-        await unlink(`./uploads/${fileName}`);
-        return new Response("Deleted");
+        const res = await fetch("http://127.0.0.1:11434/api/chat");
+        if (res.ok) {
+          const data = await res.json();
+          if (data.models?.length > 0) {
+            modelOptions = data.models
+              .map((m: any) => `<option value="${m.name}">${m.name}</option>`)
+              .join("");
+          }
+        }
       } catch (e) {
-        return new Response("Error deleting", { status: 500 });
+        console.error("Ollama not reachable for model list (run 'ollama serve'):", e);
+      }
+
+      return new Response(`
+        <html><head><style>
+          body { background:#000; color:#0f0; font-family:monospace; padding:20px; }
+          #term { height:80vh; overflow-y:auto; border:1px solid #333; padding:15px; background:#050505; margin-bottom:10px; }
+          .prompt { color:#55f; font-weight:bold; }
+          input { background:transparent; border:none; color:#0f0; outline:none; width:70%; font-family:monospace; font-size:1.1rem; }
+          select { background:#111; color:#0f0; border:1px solid #333; padding:5px; }
+        </style></head><body>
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+            <span>Jellyfish AI OS [2025]</span>
+            <select id="pk">${modelOptions}</select>
+          </div>
+          <div id="term"></div>
+          <div style="margin-top:15px">
+            <span class="prompt">jonathan@Jellyfish:~$</span>
+            <input id="cmd" autofocus autocomplete="off">
+          </div>
+          <script>
+  const input = document.getElementById('cmd');
+  const term = document.getElementById('term');
+  const picker = document.getElementById('pk');
+  
+  let history = []; 
+
+  input.addEventListener('keypress', async (e) => {
+    if (e.key === 'Enter') {
+      const val = input.value.trim();
+      if (!val) return;
+      input.value = '';
+
+      term.innerHTML += '<p><span class="prompt">jonathan@Jellyfish:~$</span> ' + val + '</p>';
+      history.push({ role: "user", content: val });
+      term.scrollTop = term.scrollHeight;
+
+      try {
+        const res = await fetch('/ask', { 
+          method: 'POST', 
+          headers: { 'Content-Type': 'application/json' }, 
+          body: JSON.stringify({ messages: history, model: picker.value }) 
+        });
+        
+        if (!res.ok) throw new Error('Server error ' + res.status);
+        
+        const text = await res.text();
+        if (!text.trim()) throw new Error('Empty AI response');
+        
+        history.push({ role: "assistant", content: text });
+
+        term.innerHTML += '<div style="color:white; margin:10px 0 20px 20px; border-left:2px solid #333; padding-left:10px; white-space: pre-wrap;">' + 
+          picker.value + '@ai: ' + text.replace(/<think>[\\s\\S]*?<\\/think>/g, '').trim() + '</div>';
+      } catch (err) {
+        term.innerHTML += '<p style="color:red">Error: ' + (err.message || 'Ollama unreachable - run "ollama serve"') + '</p>';
+      }
+      term.scrollTop = term.scrollHeight;
+    }
+  });
+</script>
+        </body></html>`, { headers: { "Content-Type": "text/html" } });
+    }
+
+    // 3. POST - /ask proxy to Ollama
+    if (req.method === "POST" && url.pathname === "/ask") {
+      let body;
+      try {
+        body = await req.json();
+      } catch {
+        return new Response("Invalid JSON", { status: 400 });
+      }
+
+      try {
+        const ollamaRes = await fetch("http://127.0.0.1:11434/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: body.model || "llama3.2:1b",
+            messages: body.messages || [],
+            stream: false,
+            options: { num_ctx: 4096 }
+          })
+        });
+
+        if (!ollamaRes.ok) {
+          const errText = await ollamaRes.text();
+          throw new Error(`Ollama ${ollamaRes.status}: ${errText}`);
+        }
+
+        const data = await ollamaRes.json();
+        let aiText = data.message?.content || "[No content]";
+        aiText = aiText.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+
+        return new Response(aiText);
+      } catch (err) {
+        console.error("Ollama proxy failed:", err);
+        return new Response(`Ollama error: ${err.message || "unreachable - start with 'ollama serve'"}`, { status: 500 });
       }
     }
 
-    // 3. Web Interface
-    if (req.method === "GET" && url.pathname === "/") {
-      return new Response(`
-        <html>
-          <body style="font-family: sans-serif; padding: 2rem;">
-            <h1>📂 Bun File Manager</h1>
-            <form action="/upload" method="POST" enctype="multipart/form-data">
-              <input type="file" name="file" required />
-              <button type="submit">Upload</button>
-            </form>
-            <hr />
-            <ul id="file-list"></ul>
-            <script>
-              async function deleteFile(name) {
-                if (confirm('Delete ' + name + '?')) {
-                  await fetch('/delete/' + encodeURIComponent(name), { method: 'DELETE' });
-                  location.reload();
-                }
-              }
-              fetch('/api/list').then(r => r.json()).then(files => {
-                const list = document.getElementById('file-list');
-                list.innerHTML = files.map(f => \`
-                  <li style="display: flex; justify-content: space-between; padding: 10px; border-bottom: 1px solid #ddd;">
-                    <a href="/\${encodeURIComponent(f)}" target="_blank">\${f}</a>
-                    <button onclick="deleteFile('\${f.replace(/'/g, "\\\\'")}')" style="background: #dc3545; color: white; border: none; padding: 5px; cursor: pointer; border-radius: 4px;">Delete</button>
-                  </li>
-                \`).join('');
-              });
-            </script>
-          </body>
-        </html>
-      `, { headers: { "Content-Type": "text/html" } });
-    }
-
-    // 4. API & Upload Logic
-    if (url.pathname === "/api/list") {
-      const { readdir } = require("node:fs/promises");
-      const files = await readdir("./uploads");
-      return Response.json(files);
-    }
-
-    if (req.method === "POST" && url.pathname === "/upload") {
-      const formData = await req.formData();
-      const file = formData.get("file") as File;
-      if (file) await Bun.write(`./uploads/${file.name}`, file);
-      return Response.redirect("/");
-    }
-
-    // 5. Download Logic
-    const fileName = decodeURIComponent(url.pathname.slice(1));
-    const file = Bun.file(`./uploads/${fileName}`);
-    return (await file.exists()) ? new Response(file) : new Response("Not Found", { status: 404 });
-  },
+    return new Response("Not Found", { status: 404 });
+  }
 });
 
-console.log("🚀 Secure Manager at http://localhost:3000 (User: Jonathan, Pass: JonathanAndJames)");
+console.log("🚀 Jellyfish AI OS running on http://localhost:3001");
+console.log("   Use Basic Auth: Jonathan / JonathanAndJames");
